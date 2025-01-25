@@ -10,6 +10,9 @@
 #    define TRACY_SAMPLING_HZ 8000
 #  elif defined __linux__
 #    define TRACY_SAMPLING_HZ 10000
+#  elif defined __3DS__
+// TODO placeholder
+#    define TRACY_SAMPLING_HZ 100
 #  endif
 #endif
 
@@ -29,6 +32,8 @@ static int GetSamplingFrequency()
 
 #if defined _WIN32
     return samplingHz > 8000 ? 8000 : ( samplingHz < 1 ? 1 : samplingHz );
+#elif defined __3DS__
+    return samplingHz > 10000 ? 10000 : ( samplingHz < 1 ? 1 : samplingHz );
 #else
     return samplingHz > 1000000 ? 1000000 : ( samplingHz < 1 ? 1 : samplingHz );
 #endif
@@ -1601,6 +1606,87 @@ void SysTraceGetExternalName( uint64_t thread, const char*& threadName, const ch
             }
         }
     }
+    name = CopyStringFast( "???", 3 );
+}
+
+}
+
+#  elif defined __3DS__
+
+#    include <3ds.h>
+#    include <atomic>
+
+#    include "../common/TracyAlloc.hpp"
+#    include "../common/TracySystem.hpp"
+#    include "TracyProfiler.hpp"
+#    include "TracyThread.hpp"
+
+
+namespace tracy
+{
+
+static Thread *s_threadVsync0;
+static std::atomic<bool> s_threadVsyncRun;
+
+bool SysTraceStart( int64_t& samplingPeriod )
+{
+
+#ifndef TRACY_NO_VSYNC_CAPTURE
+    s_threadVsyncRun.store(true);
+
+    s_threadVsync0 = (Thread*)tracy_malloc( sizeof( Thread ) );
+    new(s_threadVsync0) Thread( [] (void*) {
+        ThreadExitHandler threadExitHandler;
+        svcSetThreadPriority(CUR_THREAD_HANDLE, 0x18);
+        SetThreadName( "Tracy Vsync" );
+
+        for (;;) {
+            gspWaitForVBlank0();
+
+            auto tick0 = svcGetSystemTick();
+
+            gspWaitForVBlank1();
+
+            auto tick1 = svcGetSystemTick();
+
+            {
+                TracyLfqPrepare( QueueType::FrameVsync );
+                MemWrite( &item->frameVsync.time, tick0 );
+                MemWrite( &item->frameVsync.id, (uint32_t)0 );
+                TracyLfqCommit;
+            }
+            {
+                TracyLfqPrepare( QueueType::FrameVsync );
+                MemWrite( &item->frameVsync.time, tick1 );
+                MemWrite( &item->frameVsync.id, (uint32_t)1 );
+                TracyLfqCommit;
+            }
+
+            if (!s_threadVsyncRun.load(std::memory_order_consume)) {
+                return;
+            }
+        }
+    }, nullptr );
+#endif
+    return true;
+}
+void SysTraceStop()
+{
+#ifndef TRACY_NO_VSYNC_CAPTURE
+    s_threadVsyncRun.store(false);
+
+    s_threadVsync0->~Thread();
+    tracy_free( s_threadVsync0 );
+#endif
+}
+
+void SysTraceWorker( void* ptr )
+{
+}
+
+void SysTraceGetExternalName( uint64_t thread, const char*& threadName, const char*& name )
+{
+    threadName = CopyString( "???", 3 );
     name = CopyStringFast( "???", 3 );
 }
 

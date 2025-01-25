@@ -1,7 +1,7 @@
 #ifndef __TRACYSYSTRACE_HPP__
 #define __TRACYSYSTRACE_HPP__
 
-#if !defined TRACY_NO_SYSTEM_TRACING && ( defined _WIN32 || defined __linux__ )
+#if !defined TRACY_NO_SYSTEM_TRACING && ( defined _WIN32 || defined __linux__ || defined __3DS__ )
 #  include "../common/TracyUwp.hpp"
 #  ifndef TRACY_UWP
 #    define TRACY_HAS_SYSTEM_TRACING
