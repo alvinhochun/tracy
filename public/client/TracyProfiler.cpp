@@ -54,7 +54,13 @@
 #endif
 
 #ifdef __3DS__
+#  include <3ds.h>
 #  include <arpa/inet.h>
+
+extern "C" {
+    extern int __system_argc;
+    extern char** __system_argv;
+}
 #endif
 
 #include <algorithm>
@@ -433,6 +439,17 @@ static const char* GetProcessName()
     if( buf ) processName = buf;
 #elif defined __QNX__
     processName = __progname;
+#elif defined __3DS__
+    if (envIsHomebrew()) {
+        if (__system_argc > 0 && __system_argv[0]) {
+            const char* const buf = __system_argv[0];
+            const char* ptr = buf;
+            while( *ptr != '\0' ) ptr++;
+            while( ptr > buf && *ptr != '\\' && *ptr != '/' ) ptr--;
+            if( ptr > buf ) ptr++;
+            processName = ptr;
+        }
+    }
 #endif
     return processName;
 }
@@ -474,6 +491,13 @@ static const char* GetProcessExecutablePath()
     static char buf[_PC_PATH_MAX + 1];
     _cmdname(buf);
     return buf;
+#elif defined __3DS__
+    if (envIsHomebrew()) {
+        if (__system_argc > 0 && __system_argv[0]) {
+            return __system_argv[0];
+        }
+    }
+    return nullptr;
 #else
     return nullptr;
 #endif
@@ -554,6 +578,12 @@ static const char* GetHostInfo()
     ptr += sprintf( ptr, "OS: BSD (OpenBSD)\n" );
 #elif defined __QNX__
     ptr += sprintf( ptr, "OS: QNX\n" );
+#elif defined __3DS__
+    if (envIsHomebrew()) {
+        ptr += sprintf( ptr, "OS: 3DS (Homebrew)\n");
+    } else {
+        ptr += sprintf( ptr, "OS: 3DS\n");
+    }
 #else
     ptr += sprintf( ptr, "OS: unknown\n" );
 #endif
@@ -590,7 +620,11 @@ static const char* GetHostInfo()
 #elif defined __3DS__
     in_addr addr;
     addr.s_addr = gethostid();
-    ptr += sprintf( ptr, "User: 3ds@%s\n", inet_ntoa(addr) );
+    if (envIsHomebrew()) {
+        ptr += sprintf( ptr, "User: homebrew@%s\n", inet_ntoa(addr) );
+    } else {
+        ptr += sprintf( ptr, "User: 3ds@%s\n", inet_ntoa(addr) );
+    }
 #else
     char hostname[_POSIX_HOST_NAME_MAX]{};
     char user[_POSIX_LOGIN_NAME_MAX]{};
@@ -694,6 +728,14 @@ static const char* GetHostInfo()
         ptr += sprintf( ptr, "Device: %s\n", DecodeIosDevice( str ) );
         tracy_free( str );
     }
+#elif defined __3DS__
+    bool isNew3ds = false;
+    APT_CheckNew3DS(&isNew3ds);
+    if (isNew3ds) {
+        ptr += sprintf( ptr, "CPU: Nintendo CPU LGR A (New3DS)\n" );
+    } else {
+        ptr += sprintf( ptr, "CPU: Nintendo CPU CTR variant (Old3DS)\n" );
+    }
 #else
     ptr += sprintf( ptr, "CPU: unknown\n" );
 #endif
@@ -705,7 +747,15 @@ static const char* GetHostInfo()
     ptr += sprintf( ptr, "Device: %s %s\n", deviceManufacturer, deviceModel );
 #endif
 
+#if defined __3DS__
+    if (isNew3ds) {
+        ptr += sprintf( ptr, "CPU cores: 4 (3 usable)\n" );
+    } else {
+        ptr += sprintf( ptr, "CPU cores: 2\n" );
+    }
+#else
     ptr += sprintf( ptr, "CPU cores: %i\n", std::thread::hardware_concurrency() );
+#endif
 
 #if defined _WIN32
     MEMORYSTATUSEX statex;
@@ -745,6 +795,12 @@ static const char* GetHostInfo()
     }
     memSize = memSize / 1024 / 1024;
     ptr += sprintf( ptr, "RAM: %llu MB\n", memSize);
+#elif defined __3DS__
+    if (isNew3ds) {
+        ptr += sprintf( ptr, "RAM: 256 MB\n" );
+    } else {
+        ptr += sprintf( ptr, "RAM: 128 MB\n" );
+    }
 #else
     ptr += sprintf( ptr, "RAM: unknown\n" );
 #endif
@@ -756,6 +812,13 @@ static uint64_t GetPid()
 {
 #if defined _WIN32
     return uint64_t( GetCurrentProcessId() );
+#elif defined __3DS__
+    u32 pid = 0;
+    if (R_SUCCEEDED(svcGetProcessId(&pid, CUR_PROCESS_HANDLE))) {
+        return pid;
+    } else {
+        return UINT64_MAX;
+    }
 #else
     return uint64_t( getpid() );
 #endif
