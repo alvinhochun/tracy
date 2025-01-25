@@ -36,6 +36,10 @@
 #  include <signal.h>
 #endif
 
+#ifdef __3DS__
+#  include <3ds.h>
+#endif
+
 #if defined TRACY_TIMER_FALLBACK || !defined TRACY_HW_TIMER
 #  include <chrono>
 #endif
@@ -242,6 +246,8 @@ public:
         struct timespec ts;
         clock_gettime( CLOCK_MONOTONIC_RAW, &ts );
         return int64_t( ts.tv_sec ) * 1000000000ll + int64_t( ts.tv_nsec );
+#  elif defined __3DS__
+        return svcGetSystemTick();
 #  else
         return std::chrono::duration_cast<std::chrono::nanoseconds>( std::chrono::high_resolution_clock::now().time_since_epoch() ).count();
 #  endif
@@ -992,6 +998,9 @@ private:
 
 #if defined _WIN32
     void* m_exceptionHandler;
+#elif !defined __3DS__
+    int m_pipe[2];
+    int m_pipeBufSize;
 #endif
 #ifdef __linux__
     struct {

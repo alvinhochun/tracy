@@ -53,6 +53,10 @@
 #  include <sys/stat.h>
 #endif
 
+#ifdef __3DS__
+#  include <arpa/inet.h>
+#endif
+
 #include <algorithm>
 #include <assert.h>
 #include <atomic>
@@ -583,6 +587,10 @@ static const char* GetHostInfo()
 #  endif
 
     ptr += sprintf( ptr, "User: %s@%s\n", user, hostname );
+#elif defined __3DS__
+    in_addr addr;
+    addr.s_addr = gethostid();
+    ptr += sprintf( ptr, "User: 3ds@%s\n", inet_ntoa(addr) );
 #else
     char hostname[_POSIX_HOST_NAME_MAX]{};
     char user[_POSIX_LOGIN_NAME_MAX]{};
@@ -1396,8 +1404,8 @@ Profiler::Profiler()
     , m_bufferOffset( 0 )
     , m_bufferStart( 0 )
     , m_lz4Buf( (char*)tracy_malloc( LZ4Size + sizeof( lz4sz_t ) ) )
-    , m_serialQueue( 1024*1024 )
-    , m_serialDequeue( 1024*1024 )
+    , m_serialQueue( 16*1024 )
+    , m_serialDequeue( 16*1024 )
 #ifndef TRACY_NO_FRAME_IMAGE
     , m_fiQueue( 16 )
     , m_fiDequeue( 16 )
@@ -3667,6 +3675,10 @@ void Profiler::CalibrateTimer()
         m_timerMul = double( dt ) / double( dr );
     }
 #endif
+
+#ifdef __3DS__
+    m_timerMul = 1. / CPU_TICKS_PER_MSEC * 1000. * 1000.;
+#endif
 }
 
 void Profiler::CalibrateDelay()
@@ -3956,6 +3968,7 @@ void Profiler::HandleSymbolCodeQuery( uint64_t symbol, uint32_t size )
 void Profiler::HandleSourceCodeQuery( char* data, char* image, uint32_t id )
 {
     bool ok = false;
+#ifndef __3DS__
     FILE* f = fopen( data, "rb" );
     if( f )
     {
@@ -4044,6 +4057,7 @@ void Profiler::HandleSourceCodeQuery( char* data, char* image, uint32_t id )
             }
         }
     }
+#endif
 
     if( !ok )
     {

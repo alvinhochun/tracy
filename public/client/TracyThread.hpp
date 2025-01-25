@@ -3,6 +3,8 @@
 
 #if defined _WIN32
 #  include <windows.h>
+#elif defined __3DS__
+#  include <3ds.h>
 #else
 #  include <pthread.h>
 #endif
@@ -55,6 +57,41 @@ private:
     void(*m_func)( void* ptr );
     void* m_ptr;
     HANDLE m_hnd;
+};
+
+#elif defined __3DS__
+
+class Thread
+{
+public:
+    Thread( void(*func)( void* ptr ), void* ptr )
+        : m_func( func )
+        , m_ptr( ptr )
+    {
+        s32 prio = 0;
+        svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+        prio += 2;
+        if (prio < 0x18) {
+            prio = 0x18;
+        } else if (prio > 0x3f) {
+            prio = 0x3f;
+        }
+        m_thread = threadCreate(Launch, this, 64 * 1024, prio, -1, false);
+    }
+
+    ~Thread()
+    {
+        Result res = threadJoin(m_thread, U64_MAX);
+        threadFree(m_thread);
+    }
+
+    ::Thread Handle() const { return m_thread; }
+
+private:
+    static void Launch( void* ptr ) { ((Thread*)ptr)->m_func( ((Thread*)ptr)->m_ptr ); }
+    void(*m_func)( void* ptr );
+    void* m_ptr;
+    ::Thread m_thread;
 };
 
 #else

@@ -166,7 +166,7 @@
 static DWORD fls_key;
 #endif
 
-#if PLATFORM_POSIX
+#if PLATFORM_POSIX && !defined __3DS__
 #  include <sys/mman.h>
 #  include <sched.h>
 #  ifdef __FreeBSD__
@@ -695,7 +695,7 @@ static pthread_key_t _memory_thread_heap;
 #    else
 #      define TLS_MODEL
 #    endif
-#    if !defined(__clang__) && defined(__GNUC__)
+#    if !defined(__clang__) && defined(__GNUC__) && !defined(__3DS__)
 #      define _Thread_local __thread
 #    endif
 #  endif
@@ -885,6 +885,12 @@ _rpmalloc_mmap_os(size_t size, size_t* offset) {
 		}
 		return 0;
 	}
+#elif defined __3DS__
+	// HACK: Just using malloc.
+	void* ptr = malloc(size + padding);
+	if (!ptr) {
+		return 0;
+	}
 #else
 	int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_UNINITIALIZED;
 #  if defined(__APPLE__) && !TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
@@ -942,6 +948,10 @@ _rpmalloc_mmap_os(size_t size, size_t* offset) {
 //! Default implementation to unmap pages from virtual memory
 static void
 _rpmalloc_unmap_os(void* address, size_t size, size_t offset, size_t release) {
+#ifdef __3DS__
+	// HACK: Just forget about it
+	return;
+#else
 	rpmalloc_assert(release || (offset == 0), "Invalid unmap size");
 	rpmalloc_assert(!release || (release >= _memory_page_size), "Invalid unmap size");
 	rpmalloc_assert(size >= _memory_page_size, "Invalid unmap size");
@@ -985,6 +995,7 @@ _rpmalloc_unmap_os(void* address, size_t size, size_t offset, size_t release) {
 #endif
 	if (release)
 		_rpmalloc_stat_sub(&_mapped_pages_os, release >> _memory_page_size_shift);
+#endif
 }
 
 static void
