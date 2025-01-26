@@ -397,6 +397,11 @@ bool Socket::ReadImpl( char*& buf, int& len, int timeout )
         auto err = WSAGetLastError();
         if( err == WSAECONNABORTED || err == WSAECONNRESET ) return false;
     }
+#elif defined __3DS__
+    {
+        auto e = errno;
+        if ( e == ECONNRESET ) return false;
+    }
 #endif
     break;
     default:
