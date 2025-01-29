@@ -1622,50 +1622,445 @@ void SysTraceGetExternalName( uint64_t thread, const char*& threadName, const ch
 #    include "TracyThread.hpp"
 #    include "../tracy/Tracy.hpp"
 
+#include <libctru-prof.h>
 
-constexpr size_t SUBMIT_TIMING_QUEUE_SIZE = 4;
 
-static std::array<u64, SUBMIT_TIMING_QUEUE_SIZE> s_cmdSubmitTimingQueue{};
-static std::atomic<u16> s_cmdSubmitTimingQueueHead{};
-static std::atomic<u16> s_cmdSubmitTimingQueueTail{};
+template<typename T, size_t STORAGE_SIZE = 32, typename TSize = size_t>
+class SpscQueue {
+    std::array<T, STORAGE_SIZE> m_queue{};
+    std::atomic<TSize> m_head{};
+    std::atomic<TSize> m_tail{};
 
-extern "C" {
+public:
+    inline void enqueue(const T &item) {
+        TSize head = m_head.load(std::memory_order_relaxed);
+        TSize new_head = (head + 1) % STORAGE_SIZE;
+        assert(m_tail.load(std::memory_order_consume) != new_head);
+        m_queue[head] = item;
+        m_head.store(new_head, std::memory_order_release);
+    }
 
-Result __real_gspSubmitGxCommand(const u32 gxCommand[0x8]);
+    inline void enqueue(T &&item) {
+        TSize head = m_head.load(std::memory_order_relaxed);
+        TSize new_head = (head + 1) % STORAGE_SIZE;
+        assert(m_tail.load(std::memory_order_consume) != new_head);
+        m_queue[head] = std::move(item);
+        m_head.store(new_head, std::memory_order_release);
+    }
 
-Result __wrap_gspSubmitGxCommand(const u32 gxCommand[0x8])
+    inline T dequeue() {
+        TSize tail = m_tail.load(std::memory_order_relaxed);
+        TSize head = m_head.load(std::memory_order_acquire);
+        assert(head != tail);
+        T ret = std::move(m_queue[tail]);
+        TSize new_tail = (tail + 1) % STORAGE_SIZE;
+        m_tail.store(new_tail, std::memory_order_release);
+        return std::move(ret);
+    }
+
+    inline const T &peek() const {
+        TSize tail = m_tail.load(std::memory_order_relaxed);
+        TSize head = m_head.load(std::memory_order_acquire);
+        assert(head != tail);
+        return m_queue[tail];
+    }
+
+    inline T &mut_front() {
+        TSize tail = m_tail.load(std::memory_order_relaxed);
+        TSize head = m_head.load(std::memory_order_acquire);
+        assert(head != tail);
+        return m_queue[tail];
+    }
+
+    inline TSize size() const {
+        TSize tail = m_tail.load(std::memory_order_consume);
+        TSize head = m_head.load(std::memory_order_consume);
+        TSize fake_head = (head >= tail) ? head : (head + STORAGE_SIZE);
+        return fake_head - tail;
+    }
+
+    inline TSize free_remaining() const {
+        return STORAGE_SIZE - size() - 1;
+    }
+};
+
+
+enum class GspCmdEventType {
+    RequestDma,
+    ProcessCmdList,
+    DisplayTransfer,
+    TextureCopy,
+    MemoryFill,
+};
+
+struct GspCmdEvent {
+    u64 tick_start;
+    u64 tick_end;
+    GspCmdEventType type;
+    // union {
+    //     struct {
+    //         bool has_buf0;
+    //         bool has_buf1;
+    //     } memory_fill_data;
+    // };
+};
+
+struct GspCmdStartData {
+    u64 tick;
+    GspCmdEventType type;
+    // union {
+    //     struct {
+    //         bool has_buf0;
+    //         bool has_buf1;
+    //     } memory_fill_data;
+    // };
+};
+
+enum class GspPresentEventType {
+    Vblank0,
+    Vblank1,
+    ReplacedVblank0,
+    ReplacedVblank1,
+};
+
+struct GspPresentEvent {
+    u64 tick_start;
+    u64 tick_end;
+    GspPresentEventType type;
+};
+
+enum class GspPresentInfoState : u8 {
+    NoPending = 0,
+    Pending,
+};
+
+struct GspPresentInfo {
+    u64 tick;
+    u8 screen;
+    u8 swap;
+    bool replaced_previous;
+    GspPresentInfoState state;
+};
+
+static std::atomic<bool> s_gpuRecording{};
+static u64 s_gpuRecordingStartTicks{};
+static LightEvent s_gpuRecordingEventAvailable{};
+
+static SpscQueue<GspCmdEvent, 64> s_gspCmdEventQueue{};
+static SpscQueue<GspCmdStartData, 32> s_gspCmdStart{};
+static std::atomic<size_t> s_discardedCmdEvents{};
+
+// Access must be synchronized using s_lastPresentInfoLock.
+static std::array<GspPresentInfo, 2> s_lastPresentInfo{};
+static LightLock s_lastPresentInfoLock;
+
+static std::array<uint8_t, 2> s_gspPresentEventCtx;
+
+static void addPresentEvent(u64 tick_start, u64 tick_end, u8 screen, bool replaced_previous)
 {
-    // fprintf(stderr, "Submitting gx command\n");
-    u64 tick = svcGetSystemTick();
-    Result ret = __real_gspSubmitGxCommand(gxCommand);
+    using namespace tracy;
 
+    static constexpr SourceLocationData srclocVblank0 { "Present0", "gspSubmitGxCommand()",  "/libctru/source/services/gspgpu.c", (uint32_t)0, Color::Orange };
+    static constexpr SourceLocationData srclocVblank1 { "Present1", "gspSubmitGxCommand()",  "/libctru/source/services/gspgpu.c", (uint32_t)0, Color::Orange };
+    static constexpr SourceLocationData srclocVblank0Replaced { "Present0 (replaced)", "gspSubmitGxCommand()",  "/libctru/source/services/gspgpu.c", (uint32_t)0, Color::Red };
+    static constexpr SourceLocationData srclocVblank1Replaced { "Present1 (replaced)", "gspSubmitGxCommand()",  "/libctru/source/services/gspgpu.c", (uint32_t)0, Color::Red };
+
+    assert(s_gpuRecording.load(std::memory_order_relaxed));
+
+    static std::atomic<u16> s_qid{0};
+
+    u16 qid = s_qid.fetch_add(2, std::memory_order_relaxed);
+
+    const uint8_t ctx = s_gspPresentEventCtx[screen];
+    const SourceLocationData *srcloc;
+    if (screen == 0) {
+        if (replaced_previous) {
+            srcloc = &srclocVblank0Replaced;
+        } else {
+            srcloc = &srclocVblank0;
+        }
+    } else {
+        if (replaced_previous) {
+            srcloc = &srclocVblank1Replaced;
+        } else {
+            srcloc = &srclocVblank1;
+        }
+    }
+
+    constexpr double gpu_time_scale = (1. / CPU_TICKS_PER_USEC * 1000.);
+    auto start_gpu = (tick_start - s_gpuRecordingStartTicks) * gpu_time_scale;
+    auto end_gpu = (tick_end - s_gpuRecordingStartTicks) * gpu_time_scale;
+
+    {
+        auto item = Profiler::QueueSerial();
+        MemWrite( &item->hdr.type, tracy::QueueType::GpuZoneBeginSerial );
+        MemWrite( &item->gpuZoneBegin.cpuTime, (int64_t)tick_start );
+        memset( &item->gpuZoneBegin.thread, 0, sizeof( item->gpuZoneBegin.thread ) );
+        MemWrite( &item->gpuZoneBegin.queryId, uint16_t( qid ) );
+        MemWrite( &item->gpuZoneBegin.context, (uint8_t)ctx );
+        MemWrite( &item->gpuZoneBegin.srcloc, (uint64_t)srcloc );
+        Profiler::QueueSerialFinish();
+    }
+    {
+        auto item = Profiler::QueueSerial();
+        MemWrite( &item->hdr.type, tracy::QueueType::GpuZoneEndSerial );
+        MemWrite( &item->gpuZoneEnd.cpuTime, (int64_t)tick_start );
+        memset( &item->gpuZoneEnd.thread, 0, sizeof( item->gpuZoneEnd.thread ) );
+        MemWrite( &item->gpuZoneEnd.queryId, uint16_t( qid + 1 ) );
+        MemWrite( &item->gpuZoneEnd.context, (uint8_t)ctx );
+        Profiler::QueueSerialFinish();
+    }
+
+    {
+        auto item = Profiler::QueueSerial();
+        MemWrite( &item->hdr.type, tracy::QueueType::GpuTime );
+        MemWrite( &item->gpuTime.gpuTime, (int64_t)start_gpu );
+        MemWrite( &item->gpuTime.queryId, (uint16_t)qid );
+        MemWrite( &item->gpuTime.context, ctx );
+        Profiler::QueueSerialFinish();
+    }
+
+    {
+        auto item = Profiler::QueueSerial();
+        MemWrite( &item->hdr.type, tracy::QueueType::GpuTime );
+        MemWrite( &item->gpuTime.gpuTime, (int64_t)end_gpu );
+        MemWrite( &item->gpuTime.queryId, (uint16_t)(qid + 1) );
+        MemWrite( &item->gpuTime.context, ctx );
+        Profiler::QueueSerialFinish();
+    }
+}
+
+
+static thread_local bool s_gspPresentProfReady;
+static thread_local u8 s_gspPresentScreen = 0;
+static thread_local u8 s_gspPresentSwap = 0;
+
+void ctruProf_gspPresentBuffer_enter(unsigned int screen, unsigned int swap, const void *fb_a, const void *fb_b, u32 stride, u32 mode)
+{
+    s_gspPresentProfReady = s_gpuRecording.load(std::memory_order_relaxed);
+    if (!s_gspPresentProfReady) {
+        return;
+    }
+    LightLock_Lock(&s_lastPresentInfoLock);
+    s_gspPresentScreen = screen;
+    s_gspPresentSwap = swap;
+}
+
+void ctruProf_gspPresentBuffer_exit(bool replacedLastPresent)
+{
+    u64 tick = svcGetSystemTick();
+
+    if (!s_gspPresentProfReady) {
+        return;
+    }
+
+    auto &lastPresent = s_lastPresentInfo[s_gspPresentScreen];
+    if (lastPresent.state == GspPresentInfoState::Pending) {
+        if (replacedLastPresent) {
+            // Previous present was replaced.
+            addPresentEvent(lastPresent.tick, tick, s_gspPresentScreen, true);
+        } else {
+            fprintf(stderr, "previous present was pending, but present didn't replace it\n");
+            // This probably means we just crossed Vblank.
+            addPresentEvent(lastPresent.tick, tick, s_gspPresentScreen, false);
+        }
+    }
+    lastPresent = {
+        .tick = tick,
+        .screen = s_gspPresentScreen,
+        .swap = s_gspPresentSwap,
+        .replaced_previous = replacedLastPresent,
+        .state = GspPresentInfoState::Pending,
+    };
+
+    LightLock_Unlock(&s_lastPresentInfoLock);
+}
+
+
+static thread_local u8 s_gspSubmitCmd = 0;
+static thread_local u64 s_gspSubmitCmdTime = 0;
+
+void ctruProf_gspSubmitGxCommand_enter(const u32 gxCommand[0x8])
+{
+    s_gspSubmitCmdTime = svcGetSystemTick();
+    s_gspSubmitCmd = gxCommand[0] & 0xff;
+}
+
+void ctruProf_gspSubmitGxCommand_exit(const u32 gxCommand[0x8], Result /*result*/)
+{
     enum {
         GX_CMD_DMA = 0x00, // GSPGPU_EVENT_DMA
         GX_CMD_PROCESS_CMD_LIST = 0x01, // GSPGPU_EVENT_P3D
-        GX_CMD_MEMORY_FILL = 0x02, // GSPGPU_EVENT_PSC0 / GSPGPU_EVENT_PSC1
+        GX_CMD_MEMORY_FILL = 0x02, // GSPGPU_EVENT_PSC0 (no GSPGPU_EVENT_PSC1 at all?)
         GX_CMD_DISPLAY_TRANSFER = 0x03, // GSPGPU_EVENT_PPF
         GX_CMD_TEXTURE_COPY = 0x04, // ? (GSPGPU_EVENT_PPF ?)
         GX_CMD_FLUSH_CACHE_REGIONS = 0x05,
     };
 
-    const u32 cmd = gxCommand[0] & 0xff;
-    switch (cmd) {
+    assert(s_gspSubmitCmd == (gxCommand[0] & 0xff));
+    switch (s_gspSubmitCmd) {
+    case GX_CMD_DMA:
+        s_gspCmdStart.enqueue({
+            .tick = s_gspSubmitCmdTime,
+            .type = GspCmdEventType::RequestDma,
+        });
+        break;
     case GX_CMD_PROCESS_CMD_LIST:
+        s_gspCmdStart.enqueue({
+            .tick = s_gspSubmitCmdTime,
+            .type = GspCmdEventType::ProcessCmdList,
+        });
+        break;
+    case GX_CMD_MEMORY_FILL:
+        s_gspCmdStart.enqueue({
+            .tick = s_gspSubmitCmdTime,
+            .type = GspCmdEventType::MemoryFill,
+            // .memory_fill_data = {
+            //     .has_buf0 = (bool)gxCommand[1],
+            //     .has_buf1 = (bool)gxCommand[4],
+            // },
+        });
+        break;
+    case GX_CMD_DISPLAY_TRANSFER:
+        s_gspCmdStart.enqueue({
+            .tick = s_gspSubmitCmdTime,
+            .type = GspCmdEventType::DisplayTransfer,
+        });
+        break;
+    case GX_CMD_TEXTURE_COPY:
+        s_gspCmdStart.enqueue({
+            .tick = s_gspSubmitCmdTime,
+            .type = GspCmdEventType::TextureCopy,
+        });
         break;
     default:
-        return ret;
+        return;
     }
 
-
-    size_t head = s_cmdSubmitTimingQueueHead.load(std::memory_order_relaxed);
-    s_cmdSubmitTimingQueue[head] = tick;
-    size_t new_head = (head + 1) % SUBMIT_TIMING_QUEUE_SIZE;;
-    assert(s_cmdSubmitTimingQueueTail.load(std::memory_order_consume) != new_head);
-    s_cmdSubmitTimingQueueHead.store(new_head, std::memory_order_release);
-
-    return ret;
+    return;
 }
 
+void ctruProf_gspInterruptEvent(GSPGPU_Event irq)
+{
+    u64 tick = svcGetSystemTick();
+
+    switch (irq) {
+    case GSPGPU_EVENT_DMA:
+    case GSPGPU_EVENT_P3D:
+    case GSPGPU_EVENT_PPF:
+    case GSPGPU_EVENT_PSC0:
+        break;
+    case GSPGPU_EVENT_PSC1:
+        fprintf(stderr, "Got PSC1! Wasn't really expecting it...\n");
+        break;
+    case GSPGPU_EVENT_VBlank0:
+    case GSPGPU_EVENT_VBlank1:
+        break;
+    default:
+        return;
+    }
+
+    bool eventQueued = false;
+
+    if (irq == GSPGPU_EVENT_VBlank0 || irq == GSPGPU_EVENT_VBlank1) {
+
+        if (s_gpuRecording.load(std::memory_order_relaxed)) {
+            bool isPresentPending = gspIsPresentPending(irq == GSPGPU_EVENT_VBlank1);
+
+            LightLock_Lock(&s_lastPresentInfoLock);
+            auto &lastPresent = s_lastPresentInfo[irq == GSPGPU_EVENT_VBlank1];
+            auto lastPresentState = lastPresent.state;
+            if (lastPresentState == GspPresentInfoState::Pending) {
+                // If isPresentPending is false, it means our previously pending
+                // present has been presented. Since GSP writes the framebuffer
+                // info on vblank0 / vblank1, it is safe to assume that it just
+                // happened.
+                // `isPresentPending` may be true if the new frame was presented
+                // right after vblank but before we received the interrupt in user
+                // mode, which should be very rare if it ever happens.
+                if (!isPresentPending) {
+                    lastPresent.state = GspPresentInfoState::NoPending;
+                    u64 tick_start = lastPresent.tick;
+                    LightLock_Unlock(&s_lastPresentInfoLock);
+                    addPresentEvent(tick_start, tick, irq == GSPGPU_EVENT_VBlank1, false);
+                } else {
+                    LightLock_Unlock(&s_lastPresentInfoLock);
+                }
+            } else {
+                LightLock_Unlock(&s_lastPresentInfoLock);
+            }
+
+#ifndef TRACY_NO_VSYNC_CAPTURE
+            using namespace tracy;
+            TracyLfqPrepare( QueueType::FrameVsync );
+            MemWrite( &item->frameVsync.time, tick );
+            MemWrite( &item->frameVsync.id, (uint32_t)(irq == GSPGPU_EVENT_VBlank1) );
+            TracyLfqCommit;
+#endif
+        }
+
+    } else {
+
+        if (!s_gspCmdStart.size()) {
+            fprintf(stderr, "s_gspCmdStart is empty\n");
+            return;
+        }
+        const auto &peek = s_gspCmdStart.peek();
+        switch (irq) {
+        case GSPGPU_EVENT_DMA:
+            if (peek.type != GspCmdEventType::RequestDma) {
+                fprintf(stderr, "Mismatched event, expected DMA, got %d\n", peek.type);
+                return;
+            }
+            break;
+        case GSPGPU_EVENT_P3D:
+            if (peek.type != GspCmdEventType::ProcessCmdList) {
+                fprintf(stderr, "Mismatched event, expected cmdlist, got %d\n", peek.type);
+                return;
+            }
+            break;
+        case GSPGPU_EVENT_PPF:
+            if (peek.type != GspCmdEventType::DisplayTransfer && peek.type != GspCmdEventType::TextureCopy) {
+                fprintf(stderr, "Mismatched event, expected transfer/copy, got %d\n", peek.type);
+                return;
+            }
+            break;
+        case GSPGPU_EVENT_PSC0:
+        case GSPGPU_EVENT_PSC1:
+            if (irq == GSPGPU_EVENT_PSC1) {
+                fprintf(stderr, "Got PSC1! Wasn't really expecting it...\n");
+            }
+            if (peek.type != GspCmdEventType::MemoryFill) {
+                fprintf(stderr, "Mismatched event, expected memory fill, got %d\n", peek.type);
+                return;
+            }
+            break;
+        default:
+            return;
+        }
+
+        auto start = s_gspCmdStart.dequeue();
+
+        if (!s_gspCmdEventQueue.free_remaining()) {
+            s_discardedCmdEvents.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            s_gspCmdEventQueue.enqueue({
+                .tick_start = start.tick,
+                .tick_end = tick,
+                .type = start.type,
+                // .memory_fill_data = {
+                //     .has_buf0 = start.has_buf0,
+                //     .has_buf1 = start.has_buf1,
+                // },
+            });
+            eventQueued = true;
+        }
+
+    }
+
+    if (eventQueued && s_gpuRecording.load(std::memory_order_relaxed)) {
+        LightEvent_Signal(&s_gpuRecordingEventAvailable);
+    }
 }
 
 
@@ -1673,185 +2068,251 @@ Result __wrap_gspSubmitGxCommand(const u32 gxCommand[0x8])
 namespace tracy
 {
 
-static Thread *s_threadVsync0;
-static std::atomic<bool> s_threadVsyncRun;
-
-static Thread *s_threadP3D;
+static Thread *s_gpuRecordingThread;
 
 bool SysTraceStart( int64_t& samplingPeriod )
 {
+    LightLock_Init(&s_lastPresentInfoLock);
+    LightEvent_Init(&s_gpuRecordingEventAvailable, RESET_ONESHOT);
+    s_gpuRecordingStartTicks = svcGetSystemTick();
 
-#ifndef TRACY_NO_VSYNC_CAPTURE
-    s_threadVsyncRun.store(true);
+    // Prepare data for the present queue:
+    for (int i = 0; i < s_gspPresentEventCtx.size(); i++) {
+        auto &ctx = s_gspPresentEventCtx[i];
+        ctx = GetGpuCtxCounter().fetch_add( 1, std::memory_order_relaxed );
 
-    s_threadVsync0 = (Thread*)tracy_malloc( sizeof( Thread ) );
-    new(s_threadVsync0) Thread( [] (void*) {
-        ThreadExitHandler threadExitHandler;
-        svcSetThreadPriority(CUR_THREAD_HANDLE, 0x18);
-        SetThreadName( "Tracy Vsync" );
-
-        for (;;) {
-            gspWaitForVBlank0();
-
-            auto tick0 = svcGetSystemTick();
-
-            gspWaitForVBlank1();
-
-            auto tick1 = svcGetSystemTick();
-
-            {
-                TracyLfqPrepare( QueueType::FrameVsync );
-                MemWrite( &item->frameVsync.time, tick0 );
-                MemWrite( &item->frameVsync.id, (uint32_t)0 );
-                TracyLfqCommit;
-            }
-            {
-                TracyLfqPrepare( QueueType::FrameVsync );
-                MemWrite( &item->frameVsync.time, tick1 );
-                MemWrite( &item->frameVsync.id, (uint32_t)1 );
-                TracyLfqCommit;
-            }
-
-            if (!s_threadVsyncRun.load(std::memory_order_consume)) {
-                return;
-            }
-        }
-    }, nullptr );
-#endif
-    s_threadP3D = (Thread*)tracy_malloc( sizeof( Thread ) );
-    new(s_threadP3D) Thread( [] (void*) {
-        ThreadExitHandler threadExitHandler;
-        svcSetThreadPriority(CUR_THREAD_HANDLE, 0x18);
-        SetThreadName( "Tracy P3D" );
-
-        uint8_t ctx = GetGpuCtxCounter().fetch_add( 1, std::memory_order_relaxed );
-
-        u64 initial_ticks = svcGetSystemTick();
         {
-            u64 ticks = svcGetSystemTick();
             const float period = 1.f;
-            const auto thread = GetThreadHandle();
-            TracyLfqPrepare( QueueType::GpuNewContext );
-            MemWrite( &item->gpuNewContext.cpuTime, (int64_t)ticks );
-            MemWrite( &item->gpuNewContext.gpuTime, (int64_t)ticks );
-            MemWrite( &item->gpuNewContext.thread, thread );
+            auto item = Profiler::QueueSerial();
+            MemWrite( &item->hdr.type, tracy::QueueType::GpuNewContext );
+            MemWrite( &item->gpuNewContext.cpuTime, (int64_t)s_gpuRecordingStartTicks );
+            MemWrite( &item->gpuNewContext.gpuTime, (int64_t)0 );
+            MemWrite( &item->gpuNewContext.thread, 0 );
             MemWrite( &item->gpuNewContext.period, period );
-            MemWrite( &item->gpuNewContext.context, /*m_context*/(uint8_t)ctx );
+            MemWrite( &item->gpuNewContext.context, (uint8_t)ctx );
             MemWrite( &item->gpuNewContext.flags, uint8_t( 0 ) );
             MemWrite( &item->gpuNewContext.type, GpuContextType::OpenGl ); // just pretend to be OpenGL, nothing really wrong with that
+            Profiler::QueueSerialFinish();
+        }
 
+        {
+            auto item = Profiler::QueueSerial();
+            MemWrite( &item->hdr.type, tracy::QueueType::GpuTimeSync );
+            MemWrite( &item->gpuTimeSync.cpuTime, (int64_t)s_gpuRecordingStartTicks );
+            MemWrite( &item->gpuTimeSync.gpuTime, (int64_t)0 );
+            MemWrite( &item->gpuTimeSync.context, ctx );
+            Profiler::QueueSerialFinish();
+        }
+
+        {
+            static const std::string name_present0{"Present (Top)"};
+            static const std::string name_present1{"Present (Bottom)"};
+
+            const std::string *name;
+            if (i == 0) {
+                name = &name_present0;
+            } else {
+                name = &name_present1;
+            }
+            auto ptr = (char*)tracy_malloc( name->size() );
+            memcpy( ptr, name->c_str(), name->size() );
+
+            auto item = Profiler::QueueSerial();
+            MemWrite( &item->hdr.type, tracy::QueueType::GpuContextName );
+            MemWrite( &item->gpuContextNameFat.context, ctx );
+            MemWrite( &item->gpuContextNameFat.ptr, (uint64_t)ptr );
+            MemWrite( &item->gpuContextNameFat.size, name->size() );
+            Profiler::QueueSerialFinish();
+        }
+    }
+
+    s_gpuRecording.store(true, std::memory_order_seq_cst);
+
+    s_gpuRecordingThread = (Thread*)tracy_malloc( sizeof( Thread ) );
+    new(s_gpuRecordingThread) Thread( [] (void*) {
+        ThreadExitHandler threadExitHandler;
+        // svcSetThreadPriority(CUR_THREAD_HANDLE, 0x18);
+        SetThreadName( "Tracy GPU event collection" );
+
+        constexpr int NUM_CTX = 1;
+        std::array<uint8_t, NUM_CTX> ctx_;
+        for (auto &ctx : ctx_) {
+            ctx = GetGpuCtxCounter().fetch_add( 1, std::memory_order_relaxed );
+        }
+        // uint8_t ctx = GetGpuCtxCounter().fetch_add( 1, std::memory_order_relaxed );
+
+        for (int i = 0; i < NUM_CTX; i++) {
+            const float period = 1.f;
+            const auto thread = GetThreadHandle();
+            auto item = Profiler::QueueSerial();
+            MemWrite( &item->hdr.type, tracy::QueueType::GpuNewContext );
+            MemWrite( &item->gpuNewContext.cpuTime, (int64_t)s_gpuRecordingStartTicks );
+            MemWrite( &item->gpuNewContext.gpuTime, (int64_t)0 );
+            MemWrite( &item->gpuNewContext.thread, thread );
+            MemWrite( &item->gpuNewContext.period, period );
+            MemWrite( &item->gpuNewContext.context, /*m_context*/(uint8_t)ctx_[i] );
+            MemWrite( &item->gpuNewContext.flags, uint8_t( 0 ) );
+            MemWrite( &item->gpuNewContext.type, GpuContextType::OpenGl ); // just pretend to be OpenGL, nothing really wrong with that
+            Profiler::QueueSerialFinish();
+        }
+
+        for (int i = 0; i < NUM_CTX; i++) {
+            auto item = Profiler::QueueSerial();
+            MemWrite( &item->hdr.type, tracy::QueueType::GpuTimeSync );
+            MemWrite( &item->gpuTimeSync.cpuTime, (int64_t)s_gpuRecordingStartTicks );
+            MemWrite( &item->gpuTimeSync.gpuTime, (int64_t)0 );
+            MemWrite( &item->gpuTimeSync.context, ctx_[i] );
+            Profiler::QueueSerialFinish();
+        }
+
+        for (int i = 0; i < NUM_CTX; i++) {
+            static const std::string name_gspgpu{"GSPGPU"};
+
+            const std::string *name;
+            {
+                name = &name_gspgpu;
+            }
+            auto ptr = (char*)tracy_malloc( name->size() );
+            memcpy( ptr, name->c_str(), name->size() );
+
+            auto item = Profiler::QueueSerial();
+            MemWrite( &item->hdr.type, tracy::QueueType::GpuContextName );
+            MemWrite( &item->gpuContextNameFat.context, ctx_[i] );
+            MemWrite( &item->gpuContextNameFat.ptr, (uint64_t)ptr );
+            MemWrite( &item->gpuContextNameFat.size, name->size() );
 #ifdef TRACY_ON_DEMAND
             GetProfiler().DeferItem( *item );
 #endif
-
-            TracyLfqCommit;
+            Profiler::QueueSerialFinish();
         }
 
-        {
-            TracyLfqPrepare( QueueType::GpuTimeSync );
-            MemWrite( &item->gpuTimeSync.cpuTime, (int64_t)initial_ticks );
-            MemWrite( &item->gpuTimeSync.gpuTime, (int64_t)0 );
-            MemWrite( &item->gpuTimeSync.context, ctx );
-            TracyLfqCommit;
-        }
-
-        {
-            auto ptr = (char*)tracy_malloc( 6 );
-            memcpy( ptr, "GSPGPU", 6 );
-
-            TracyLfqPrepare( QueueType::GpuContextName );
-            MemWrite( &item->gpuContextNameFat.context, ctx );
-            MemWrite( &item->gpuContextNameFat.ptr, (uint64_t)ptr );
-            MemWrite( &item->gpuContextNameFat.size, 6 );
-    #ifdef TRACY_ON_DEMAND
-            GetProfiler().DeferItem( *item );
-    #endif
-            TracyLfqCommit;
-        }
+        std::array<u64, NUM_CTX> ctx_end_times{};
 
         u16 qid = 0;
+        u64 last_event_end = 0;
 
         for (;;) {
-            gspWaitForP3D();
 
-            auto end_tick = svcGetSystemTick();
+            static constexpr tracy::SourceLocationData srclocUndef { "(Unknown)", "gspSubmitGxCommand()", "/libctru/source/services/gspgpu.c", (uint32_t)0, Color::Black };
+            static constexpr tracy::SourceLocationData srclocDma { "Request DMA", "gspSubmitGxCommand()", "/libctru/source/services/gspgpu.c", (uint32_t)0, Color::Aqua };
+            static constexpr tracy::SourceLocationData srclocCmdQueue { "Command Queue", "gspSubmitGxCommand()", "/libctru/source/services/gspgpu.c", (uint32_t)0, Color::Yellow };
+            static constexpr tracy::SourceLocationData srclocDispXfer { "DisplayTransfer", "gspSubmitGxCommand()",  "/libctru/source/services/gspgpu.c", (uint32_t)0, Color::Lime };
+            static constexpr tracy::SourceLocationData srclocTexCpy { "TextureCopy", "gspSubmitGxCommand()",  "/libctru/source/services/gspgpu.c", (uint32_t)0, Color::Green };
+            static constexpr tracy::SourceLocationData srclocMemFill { "MemoryFill", "gspSubmitGxCommand()",  "/libctru/source/services/gspgpu.c", (uint32_t)0, Color::Purple };
 
-            auto head = s_cmdSubmitTimingQueueHead.load(std::memory_order_acquire);
-            auto tail = s_cmdSubmitTimingQueueTail.load(std::memory_order_relaxed);
-            assert(head != tail);
-            auto fake_head = head > tail ? head : (head + SUBMIT_TIMING_QUEUE_SIZE);
-            u64 start_tick = s_cmdSubmitTimingQueue[tail];
-            size_t new_tail;
-            if (fake_head - tail == 1) {
-                new_tail = head;
-            } else {
-                new_tail = (fake_head - 1) % SUBMIT_TIMING_QUEUE_SIZE;
-                end_tick = s_cmdSubmitTimingQueue[new_tail];
-            }
-            
-            s_cmdSubmitTimingQueueTail.store(new_tail, std::memory_order_release);
+            if (auto discarded = s_discardedCmdEvents.exchange(0, std::memory_order_relaxed)) {
+                auto ptr = (char*)tracy_malloc( 36 );
+                size_t size = snprintf(ptr, 36, "Discarded %zu GSP events", discarded);
 
-            static constexpr tracy::SourceLocationData srcloc { "Command Queue", TracyFunction,  TracyFile, (uint32_t)TracyLine, 0 };
-
-            constexpr double gpu_time_scale = (1. / CPU_TICKS_PER_USEC * 1000.);
-            auto start_gpu = (start_tick - initial_ticks) * gpu_time_scale;
-            auto end_gpu = (end_tick - initial_ticks) * gpu_time_scale;
-
-            {
-                TracyLfqPrepare( QueueType::GpuZoneBegin );
-                MemWrite( &item->gpuZoneBegin.cpuTime, (int64_t)start_tick );
-                memset( &item->gpuZoneBegin.thread, 0, sizeof( item->gpuZoneBegin.thread ) );
-                MemWrite( &item->gpuZoneBegin.queryId, uint16_t( qid ) );
-                MemWrite( &item->gpuZoneBegin.context, (uint8_t)ctx );
-                MemWrite( &item->gpuZoneBegin.srcloc, (uint64_t)&srcloc );
-                TracyLfqCommit;
-            }
-            {
-                TracyLfqPrepare( QueueType::GpuZoneEnd );
-                MemWrite( &item->gpuZoneEnd.cpuTime, (int64_t)start_tick );
-                memset( &item->gpuZoneEnd.thread, 0, sizeof( item->gpuZoneEnd.thread ) );
-                MemWrite( &item->gpuZoneEnd.queryId, uint16_t( qid + 1 ) );
-                MemWrite( &item->gpuZoneEnd.context, (uint8_t)ctx );
-                TracyLfqCommit;
+                TracyQueuePrepare( QueueType::Message );
+                MemWrite( &item->messageFat.time, (int64_t)svcGetSystemTick() );
+                MemWrite( &item->messageFat.text, (uint64_t)ptr );
+                MemWrite( &item->messageFat.size, (uint16_t)size );
+                TracyQueueCommit( messageFatThread );
             }
 
-            {
-                TracyLfqPrepare( QueueType::GpuTime );
-                MemWrite( &item->gpuTime.gpuTime, (int64_t)start_gpu );
-                MemWrite( &item->gpuTime.queryId, (uint16_t)qid );
-                MemWrite( &item->gpuTime.context, ctx );
-                TracyLfqCommit;
+            while (s_gspCmdEventQueue.size()) {
+                auto event = s_gspCmdEventQueue.dequeue();
+
+                const tracy::SourceLocationData *srcloc = &srclocUndef;
+                switch (event.type) {
+                case GspCmdEventType::RequestDma:
+                    srcloc = &srclocDma;
+                    break;
+                case GspCmdEventType::ProcessCmdList:
+                    srcloc = &srclocCmdQueue;
+                    break;
+                case GspCmdEventType::DisplayTransfer:
+                    srcloc = &srclocDispXfer;
+                    break;
+                case GspCmdEventType::TextureCopy:
+                    srcloc = &srclocTexCpy;
+                    break;
+                case GspCmdEventType::MemoryFill:
+                    srcloc = &srclocMemFill;
+                    break;
+                }
+
+                if (event.tick_start < s_gpuRecordingStartTicks) {
+                    fprintf(stderr, "Skipping gsp event before profiler start\n");
+                    continue;
+                }
+
+                const uint8_t ctx = ctx_[0];
+
+                u64 real_start;
+                if (event.tick_start > last_event_end) {
+                    real_start = event.tick_start;
+                    // printf("a\n");
+                } else {
+                    real_start = last_event_end;
+                    // printf("b\n");
+                }
+                last_event_end = event.tick_end;
+
+                constexpr double gpu_time_scale = (1. / CPU_TICKS_PER_USEC * 1000.);
+                auto start_gpu = (real_start - s_gpuRecordingStartTicks) * gpu_time_scale;
+                auto end_gpu = (event.tick_end - s_gpuRecordingStartTicks) * gpu_time_scale;
+
+                {
+                    auto item = Profiler::QueueSerial();
+                    MemWrite( &item->hdr.type, tracy::QueueType::GpuZoneBeginSerial );
+                    MemWrite( &item->gpuZoneBegin.cpuTime, (int64_t)event.tick_start );
+                    memset( &item->gpuZoneBegin.thread, 0, sizeof( item->gpuZoneBegin.thread ) );
+                    MemWrite( &item->gpuZoneBegin.queryId, uint16_t( qid ) );
+                    MemWrite( &item->gpuZoneBegin.context, (uint8_t)ctx );
+                    MemWrite( &item->gpuZoneBegin.srcloc, (uint64_t)srcloc );
+                    Profiler::QueueSerialFinish();
+                }
+                {
+                    auto item = Profiler::QueueSerial();
+                    MemWrite( &item->hdr.type, tracy::QueueType::GpuZoneEndSerial );
+                    MemWrite( &item->gpuZoneEnd.cpuTime, (int64_t)event.tick_start );
+                    memset( &item->gpuZoneEnd.thread, 0, sizeof( item->gpuZoneEnd.thread ) );
+                    MemWrite( &item->gpuZoneEnd.queryId, uint16_t( qid + 1 ) );
+                    MemWrite( &item->gpuZoneEnd.context, (uint8_t)ctx );
+                    Profiler::QueueSerialFinish();
+                }
+
+                {
+                    auto item = Profiler::QueueSerial();
+                    MemWrite( &item->hdr.type, tracy::QueueType::GpuTime );
+                    MemWrite( &item->gpuTime.gpuTime, (int64_t)start_gpu );
+                    MemWrite( &item->gpuTime.queryId, (uint16_t)qid );
+                    MemWrite( &item->gpuTime.context, ctx );
+                    Profiler::QueueSerialFinish();
+                }
+
+                {
+                    auto item = Profiler::QueueSerial();
+                    MemWrite( &item->hdr.type, tracy::QueueType::GpuTime );
+                    MemWrite( &item->gpuTime.gpuTime, (int64_t)end_gpu );
+                    MemWrite( &item->gpuTime.queryId, (uint16_t)(qid + 1) );
+                    MemWrite( &item->gpuTime.context, ctx );
+                    Profiler::QueueSerialFinish();
+                }
+
+                qid += 2;
             }
 
-            {
-                TracyLfqPrepare( QueueType::GpuTime );
-                MemWrite( &item->gpuTime.gpuTime, (int64_t)end_gpu );
-                MemWrite( &item->gpuTime.queryId, (uint16_t)(qid + 1) );
-                MemWrite( &item->gpuTime.context, ctx );
-                TracyLfqCommit;
-            }
-
-            qid += 2;
-
-            if (!s_threadVsyncRun.load(std::memory_order_consume)) {
+            if (!s_gpuRecording.load(std::memory_order_consume)) {
                 return;
             }
+
+            LightEvent_Wait(&s_gpuRecordingEventAvailable);
         }
     }, nullptr );
+
     return true;
 }
 
 void SysTraceStop()
 {
-#ifndef TRACY_NO_VSYNC_CAPTURE
-    s_threadVsyncRun.store(false);
+    s_gpuRecording.store(false);
+    LightEvent_Signal(&s_gpuRecordingEventAvailable);
 
-    s_threadVsync0->~Thread();
-    tracy_free( s_threadVsync0 );
-    // HACK: Leak the thread
-    // s_threadP3D->~Thread();
-    // tracy_free( s_threadP3D );
-#endif
+    s_gpuRecordingThread->~Thread();
+    tracy_free( s_gpuRecordingThread );
 }
 
 void SysTraceWorker( void* ptr )
