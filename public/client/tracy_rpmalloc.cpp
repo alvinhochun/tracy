@@ -948,10 +948,6 @@ _rpmalloc_mmap_os(size_t size, size_t* offset) {
 //! Default implementation to unmap pages from virtual memory
 static void
 _rpmalloc_unmap_os(void* address, size_t size, size_t offset, size_t release) {
-#ifdef __3DS__
-	// HACK: Just forget about it
-	return;
-#else
 	rpmalloc_assert(release || (offset == 0), "Invalid unmap size");
 	rpmalloc_assert(!release || (release >= _memory_page_size), "Invalid unmap size");
 	rpmalloc_assert(size >= _memory_page_size, "Invalid unmap size");
@@ -967,6 +963,11 @@ _rpmalloc_unmap_os(void* address, size_t size, size_t offset, size_t release) {
 #if PLATFORM_WINDOWS
 	if (!VirtualFree(address, release ? 0 : size, release ? MEM_RELEASE : MEM_DECOMMIT)) {
 		rpmalloc_assert(0, "Failed to unmap virtual memory block");
+	}
+#elif defined __3DS__
+	// HACK
+	if (release) {
+		free(address);
 	}
 #else
 	if (release) {
@@ -995,7 +996,6 @@ _rpmalloc_unmap_os(void* address, size_t size, size_t offset, size_t release) {
 #endif
 	if (release)
 		_rpmalloc_stat_sub(&_mapped_pages_os, release >> _memory_page_size_shift);
-#endif
 }
 
 static void

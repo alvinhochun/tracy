@@ -1,7 +1,7 @@
 project('tracy', ['cpp'], version: '0.11.0', meson_version: '>=1.1.0')
 
 # internal compiler flags
-tracy_compile_args = ['-ftls-model=initial-exec', '-DTRACY_NO_CRASH_HANDLER']
+tracy_compile_args = []
 
 # compiler flags shared between the capture library itself and the code using it
 tracy_common_args = []
