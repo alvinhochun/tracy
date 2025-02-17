@@ -579,11 +579,9 @@ static const char* GetHostInfo()
 #elif defined __QNX__
     ptr += sprintf( ptr, "OS: QNX\n" );
 #elif defined __3DS__
-    if (envIsHomebrew()) {
-        ptr += sprintf( ptr, "OS: 3DS (Homebrew)\n");
-    } else {
-        ptr += sprintf( ptr, "OS: 3DS\n");
-    }
+    char sysverstr[32];
+    osGetSystemVersionDataString(nullptr, nullptr, sysverstr, 32);
+    ptr += sprintf( ptr, "OS: 3DS System %s%s\n", sysverstr, envIsHomebrew() ? " (Homebrew)" : "");
 #else
     ptr += sprintf( ptr, "OS: unknown\n" );
 #endif
@@ -729,13 +727,23 @@ static const char* GetHostInfo()
         tracy_free( str );
     }
 #elif defined __3DS__
-    bool isNew3ds = false;
-    APT_CheckNew3DS(&isNew3ds);
-    if (isNew3ds) {
-        ptr += sprintf( ptr, "CPU: Nintendo CPU LGR A (New3DS)\n" );
-    } else {
-        ptr += sprintf( ptr, "CPU: Nintendo CPU CTR variant (Old3DS)\n" );
+    u8 model = 6;
+    if (R_SUCCEEDED(cfguInit())) {
+        if (R_FAILED(CFGU_GetSystemModel(&model))) {
+            model = 6;
+        }
+        cfguExit();
     }
+    const auto models = {
+        "CTR - (Old) 3DS",
+        "SPR - (Old) 3DS XL/LL",
+        "KTR - New 3DS",
+        "FTR - (Old) 2DS",
+        "RED - New 3DS XL/LL",
+        "JAN - New 2DS XL/LL",
+        "(unknown)",
+    };
+    ptr += sprintf( ptr, "Device: Nintendo %s\n", *(models.begin() + model) );
 #else
     ptr += sprintf( ptr, "CPU: unknown\n" );
 #endif
@@ -748,8 +756,15 @@ static const char* GetHostInfo()
 #endif
 
 #if defined __3DS__
+    bool isNew3ds = false;
+    if (R_SUCCEEDED(aptInit())) {
+        if (R_FAILED(APT_CheckNew3DS(&isNew3ds))) {
+            isNew3ds = false;
+        }
+        aptExit();
+    }
     if (isNew3ds) {
-        ptr += sprintf( ptr, "CPU cores: 4 (3 usable)\n" );
+        ptr += sprintf( ptr, "CPU cores: 4\n" );
     } else {
         ptr += sprintf( ptr, "CPU cores: 2\n" );
     }
@@ -796,11 +811,8 @@ static const char* GetHostInfo()
     memSize = memSize / 1024 / 1024;
     ptr += sprintf( ptr, "RAM: %llu MB\n", memSize);
 #elif defined __3DS__
-    if (isNew3ds) {
-        ptr += sprintf( ptr, "RAM: 256 MB\n" );
-    } else {
-        ptr += sprintf( ptr, "RAM: 128 MB\n" );
-    }
+    u32 totalRam = osGetMemRegionSize(MEMREGION_ALL);
+    ptr += sprintf( ptr, "RAM: %d MB\n", /* isNew3ds ? 256 : 128 */ totalRam / 1024 / 1024 );
 #else
     ptr += sprintf( ptr, "RAM: unknown\n" );
 #endif
