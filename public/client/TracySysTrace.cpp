@@ -1694,7 +1694,8 @@ enum class GspCmdEventType {
 };
 
 struct GspCmdEvent {
-    u64 tick_start;
+    u64 tick_start_enter;
+    u64 tick_start_exit;
     u64 tick_end;
     GspCmdEventType type;
     // union {
@@ -1706,7 +1707,8 @@ struct GspCmdEvent {
 };
 
 struct GspCmdStartData {
-    u64 tick;
+    u64 tick_enter;
+    u64 tick_exit;
     GspCmdEventType type;
     // union {
     //     struct {
@@ -1888,6 +1890,8 @@ void ctruProf_gspSubmitGxCommand_enter(const u32 gxCommand[0x8])
 
 void ctruProf_gspSubmitGxCommand_exit(const u32 gxCommand[0x8], Result /*result*/)
 {
+    u64 tick_exit = svcGetSystemTick();
+
     enum {
         GX_CMD_DMA = 0x00, // GSPGPU_EVENT_DMA
         GX_CMD_PROCESS_CMD_LIST = 0x01, // GSPGPU_EVENT_P3D
@@ -1901,19 +1905,22 @@ void ctruProf_gspSubmitGxCommand_exit(const u32 gxCommand[0x8], Result /*result*
     switch (s_gspSubmitCmd) {
     case GX_CMD_DMA:
         s_gspCmdStart.enqueue({
-            .tick = s_gspSubmitCmdTime,
+            .tick_enter = s_gspSubmitCmdTime,
+            .tick_exit = tick_exit,
             .type = GspCmdEventType::RequestDma,
         });
         break;
     case GX_CMD_PROCESS_CMD_LIST:
         s_gspCmdStart.enqueue({
-            .tick = s_gspSubmitCmdTime,
+            .tick_enter = s_gspSubmitCmdTime,
+            .tick_exit = tick_exit,
             .type = GspCmdEventType::ProcessCmdList,
         });
         break;
     case GX_CMD_MEMORY_FILL:
         s_gspCmdStart.enqueue({
-            .tick = s_gspSubmitCmdTime,
+            .tick_enter = s_gspSubmitCmdTime,
+            .tick_exit = tick_exit,
             .type = GspCmdEventType::MemoryFill,
             // .memory_fill_data = {
             //     .has_buf0 = (bool)gxCommand[1],
@@ -1923,13 +1930,15 @@ void ctruProf_gspSubmitGxCommand_exit(const u32 gxCommand[0x8], Result /*result*
         break;
     case GX_CMD_DISPLAY_TRANSFER:
         s_gspCmdStart.enqueue({
-            .tick = s_gspSubmitCmdTime,
+            .tick_enter = s_gspSubmitCmdTime,
+            .tick_exit = tick_exit,
             .type = GspCmdEventType::DisplayTransfer,
         });
         break;
     case GX_CMD_TEXTURE_COPY:
         s_gspCmdStart.enqueue({
-            .tick = s_gspSubmitCmdTime,
+            .tick_enter = s_gspSubmitCmdTime,
+            .tick_exit = tick_exit,
             .type = GspCmdEventType::TextureCopy,
         });
         break;
@@ -2045,7 +2054,8 @@ void ctruProf_gspInterruptEvent(GSPGPU_Event irq)
             s_discardedCmdEvents.fetch_add(1, std::memory_order_relaxed);
         } else {
             s_gspCmdEventQueue.enqueue({
-                .tick_start = start.tick,
+                .tick_start_enter = start.tick_enter,
+                .tick_start_exit = start.tick_exit,
                 .tick_end = tick,
                 .type = start.type,
                 // .memory_fill_data = {
@@ -2233,7 +2243,7 @@ bool SysTraceStart( int64_t& samplingPeriod )
                     break;
                 }
 
-                if (event.tick_start < s_gpuRecordingStartTicks) {
+                if (event.tick_start_enter < s_gpuRecordingStartTicks) {
                     fprintf(stderr, "Skipping gsp event before profiler start\n");
                     continue;
                 }
@@ -2241,8 +2251,8 @@ bool SysTraceStart( int64_t& samplingPeriod )
                 const uint8_t ctx = ctx_[0];
 
                 u64 real_start;
-                if (event.tick_start > last_event_end) {
-                    real_start = event.tick_start;
+                if (event.tick_start_exit > last_event_end) {
+                    real_start = event.tick_start_exit;
                     // printf("a\n");
                 } else {
                     real_start = last_event_end;
@@ -2257,7 +2267,7 @@ bool SysTraceStart( int64_t& samplingPeriod )
                 {
                     auto item = Profiler::QueueSerial();
                     MemWrite( &item->hdr.type, tracy::QueueType::GpuZoneBeginSerial );
-                    MemWrite( &item->gpuZoneBegin.cpuTime, (int64_t)event.tick_start );
+                    MemWrite( &item->gpuZoneBegin.cpuTime, (int64_t)event.tick_start_enter );
                     memset( &item->gpuZoneBegin.thread, 0, sizeof( item->gpuZoneBegin.thread ) );
                     MemWrite( &item->gpuZoneBegin.queryId, uint16_t( qid ) );
                     MemWrite( &item->gpuZoneBegin.context, (uint8_t)ctx );
@@ -2267,7 +2277,7 @@ bool SysTraceStart( int64_t& samplingPeriod )
                 {
                     auto item = Profiler::QueueSerial();
                     MemWrite( &item->hdr.type, tracy::QueueType::GpuZoneEndSerial );
-                    MemWrite( &item->gpuZoneEnd.cpuTime, (int64_t)event.tick_start );
+                    MemWrite( &item->gpuZoneEnd.cpuTime, (int64_t)event.tick_start_exit );
                     memset( &item->gpuZoneEnd.thread, 0, sizeof( item->gpuZoneEnd.thread ) );
                     MemWrite( &item->gpuZoneEnd.queryId, uint16_t( qid + 1 ) );
                     MemWrite( &item->gpuZoneEnd.context, (uint8_t)ctx );
